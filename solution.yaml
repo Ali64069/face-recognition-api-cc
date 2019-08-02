@@ -1,0 +1,353 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: This template creates Lambda and the API Gateway for Face Recognition API.
+
+Parameters:
+  pSolutionNaming:
+    Type: String
+
+  pSlackChannel:
+    Type: String
+    Description: 'Slack channel to use'
+
+  pSlackURL:
+    Type: String
+    Description: 'Slack URL to use'
+
+  pSlackIcon:
+    Type: String
+    Description: 'Slack icon to use'
+
+Resources:
+  rCommonPolicyForLambdas:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Policy allowing log stream access, vpc config and xray config
+      Path: !Sub '/service/'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: arn:aws:logs:*:*:*
+          - Effect: Allow
+            Action:
+              - ec2:CreateNetworkInterface
+              - ec2:DescribeNetworkInterfaces
+              - ec2:DescribeNetworkInterface
+              - ec2:DeleteNetworkInterface
+              - ec2:DescribeVpcEndpoints
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - xray:PutTraceSegments
+              - xray:PutTelemetryRecords
+              - xray:GetSamplingRules
+              - xray:GetSamplingTargets
+              - xray:GetSamplingStatisticSummaries
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - sagemaker:InvokeEndpoint
+            Resource: '*'
+
+  rProxyApiLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: '/service/'
+      RoleName: !Sub '${pSolutionNaming}-${AWS::Region}-proxy-api-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref rCommonPolicyForLambdas
+
+  rProxyApiLambda:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - rProxyApiLambdaExecutionRole
+    Properties:
+      FunctionName: !Sub '${pSolutionNaming}-proxy-api-lambda'
+      Description: Jojonomic Face Recognition - Proxy API - Lambda
+      Runtime: nodejs8.10
+      Role: !Sub ${rProxyApiLambdaExecutionRole.Arn}
+      Code: source/.webpack
+      Handler: lambdas/ProxyApi.handler
+      MemorySize: 256
+      Timeout: 30
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          MONITORING_ALERT: enabled
+          VPC_VALIDATION: disabled
+
+  rApiGatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /service/
+      RoleName: !Sub '${pSolutionNaming}-api-gateway-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${pSolutionNaming}-api-gateway-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                  - logs:PutLogEvents
+                  - logs:GetLogEvents
+                  - logs:FilterLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - apigateway:POST
+                Resource: '*'
+        - PolicyName: !Sub '${pSolutionNaming}-api-lambda-invoke-lambda-iam-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: arn:aws:lambda:*:*:function:*
+
+  rApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${pSolutionNaming}-api-gateway'
+      Description: Mail Service - API Rest Gateway
+      FailOnWarnings: true
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  rApiGatewayLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:invokeFunction
+      FunctionName: !Sub ${rProxyApiLambda.Arn}
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub
+        - arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGatewayRef}/*
+        - {ApiGatewayRef: !Ref rApiGateway}
+
+  rApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !Sub ${rApiGatewayRole.Arn}
+
+  rApiProxyGatewayResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref rApiGateway
+      ParentId: !Sub ${rApiGateway.RootResourceId}
+      PathPart: '{proxy+}'
+
+  rApiProxyAnyHandler:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      ResourceId: !Ref rApiProxyGatewayResource
+      RestApiId: !Ref rApiGateway
+      HttpMethod: ANY
+      ApiKeyRequired: false
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref rApiGatewayCognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${rProxyApiLambda.Arn}/invocations'
+      MethodResponses: []
+
+  rApiGatewayResponseDefault4XX:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref rApiGateway
+      ResponseType: DEFAULT_4XX
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'*'"
+      ResponseTemplates:
+        application/json: '{"code": 403,"errors": {"response": "Invalid or unauthorized access"}}'
+
+  rApiGatewayDeploymentHASHDATE:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - rApiProxyAnyHandler
+    Description: Mail Service - Deployment of API Gateway endpoints
+    Properties:
+      RestApiId: !Ref rApiGateway
+      StageName: !Sub 'mstrStage'
+
+  rApiGatewayStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      StageName: mstr
+      RestApiId: !Ref rApiGateway
+      DeploymentId: !Ref rApiGatewayDeploymentHASHDATE
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          MetricsEnabled: 'true'
+          DataTraceEnabled: 'true'
+          LoggingLevel: INFO
+
+  rCognitoB2BCredentialGeneratorLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /service/
+      RoleName: !Sub '${pSolutionNaming}-b2bgen-lambda-iam-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref rCommonPolicyForLambdas
+      Policies:
+        - PolicyName: !Sub '${pSolutionNaming}-b2bgen-lambda-log-iam-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:CreateSecret
+                  - secretsmanager:ListSecrets
+                  - secretsmanager:UpdateSecret
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cognito-idp:CreateUserPoolClient
+                  - cognito-idp:DeleteUserPoolClient
+                  - cognito-idp:CreateUserPool
+                  - cognito-idp:ListUserPools
+                  - cognito-idp:ListUserPoolClients
+                  - cognito-idp:CreateResourceServer
+                  - cognito-idp:CreateUserPoolDomain
+                  - cognito-idp:DescribeUserPoolDomain
+                  - cognito-idp:DeleteUserPoolDomain
+                Resource: '*'
+
+  rCognitoB2BCredentialGeneratorLambda:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - rCognitoB2BCredentialGeneratorLambdaExecutionRole
+    Properties:
+      FunctionName: !Sub '${pSolutionNaming}-b2b-credgen-lambda'
+      Description: Cognito B2B Credential Generator Lambda
+      Runtime: nodejs8.10
+      Role: !Sub ${rCognitoB2BCredentialGeneratorLambdaExecutionRole.Arn}
+      Code: source/.webpack
+      Handler: customResources/B2BCredentialGenerator.handler
+      MemorySize: 256
+      Timeout: 30
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          USER_POOL_NAME: !Sub '${pSolutionNaming}-3rdparty-user-pool'
+          MONITORING_ALERT: disabled
+          LOG_LEVEL: DEBUG
+
+  rCustomCognitoB2BCredentialGenerator:
+    Type: Custom::CognitoB2B
+    DependsOn: rCognitoB2BCredentialGeneratorLambda
+    Properties:
+      ServiceToken: !Sub '${rCognitoB2BCredentialGeneratorLambda.Arn}'
+      Name: !Sub '${pSolutionNaming}-b2b-cred-gen'
+      Description: Custom Cognito B2B Credential Generator Lambda
+      Random: HASHDATE
+
+  rApiGatewayCognitoLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /service/
+      RoleName: !Sub '${pSolutionNaming}-cognito-lambda-iam-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref rCommonPolicyForLambdas
+      Policies:
+        - PolicyName: !Sub '${pSolutionNaming}-cognito-lambda-iam-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: '*'
+
+  rApiGatewayCognitoLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${pSolutionNaming}-api-cognito-lambda'
+      Description: API Cognito Authorizer Lambda
+      Runtime: nodejs8.10
+      Role: !Sub ${rApiGatewayCognitoLambdaExecutionRole.Arn}
+      Code: source/.webpack
+      Handler: authorizers/ApiGatewayCognito.handler
+      MemorySize: 256
+      Timeout: 30
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          USER_POOL_NAME: !Sub '${pSolutionNaming}-3rdparty-user-pool'
+          MONITORING_ALERT: disabled
+          LOG_LEVEL: DEBUG
+          REGION: !Sub ${AWS::Region}
+
+  rApiGatewayCognitoAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      AuthorizerCredentials: !Sub ${rApiGatewayRole.Arn}
+      Name: !Sub '${pSolutionNaming}-api-gateway-cognito-custom-authorizer'
+      RestApiId: !Ref rApiGateway
+      IdentitySource: method.request.header.Authorization
+      Type: TOKEN
+      AuthorizerUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${rApiGatewayCognitoLambda.Arn}/invocations'
+      AuthorizerResultTtlInSeconds: 300
+
+Outputs:
+  oRestApi:
+    Value: !Ref rApiGateway
+    Export:
+      Name: !Sub '${pSolutionNaming}-rest-api'

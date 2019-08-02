@@ -1,0 +1,42 @@
+{
+  "compilerOptions": {
+    "target": "es6",
+    "outDir": "./dist",
+    "module": "commonjs",
+    "lib": [
+      "dom",
+      "es7",
+      "esnext.asynciterable",
+      "es2015"
+    ],
+    "allowJs": false,
+    "moduleResolution": "node",
+    "newLine": "LF",
+    "experimentalDecorators": true,
+    "declaration": true,
+    "noImplicitAny": false,
+    "strictNullChecks": true,
+    "noImplicitReturns": true,
+    "noImplicitThis": true,
+    "sourceMap": false,
+    "noUnusedLocals": true,
+    "preserveConstEnums": true,
+    "suppressImplicitAnyIndexErrors": true,
+    "forceConsistentCasingInFileNames": true,
+  },
+  "types": [
+    "typePatches"
+  ],
+  "include": [
+    "lib/*",
+    "lambdas/*"
+  ],
+  "exclude": [
+    "dist",
+    ".build",
+    ".serverless",
+    ".webpack",
+    "node_modules",
+    ".vscode"
+  ]
+}
